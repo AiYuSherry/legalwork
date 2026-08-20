@@ -13,10 +13,12 @@ import {
   DEFAULT_MAX_AGENT_LOOP_STEPS,
   MAX_AGENT_LOOP_STEPS_ENV,
   MAX_AGENT_LOOP_STEPS_ENV_CAP,
+  allowedToolNamesWithGuiStateTools,
   assistantAnnouncesPendingToolWork,
   isBareResearchTopicPrompt,
   attachmentIdsForTurn,
   isContextWindowExceededError,
+  isRetrievalToolUnavailableMessage,
   knowledgeShellBypassError,
   requestedDocumentArtifacts,
   requestsLocalKnowledgeRetrieval,
@@ -117,6 +119,34 @@ describe('AgentLoop', () => {
     expect(isBareResearchTopicPrompt('整理引注到word')).toBe(false)
     expect(isBareResearchTopicPrompt('把这个文档排版一下')).toBe(false)
     expect(isBareResearchTopicPrompt('把附件整理成docx文件')).toBe(false)
+  })
+
+  it('keeps read-only retrieval tools available when a document Skill narrows the catalog', () => {
+    const allowed = allowedToolNamesWithGuiStateTools(
+      ['document_skill_execute', 'read'],
+      false,
+      '我想写一份公诉意见书，请修订一下',
+      ['legal-document-formatting']
+    )
+
+    expect(allowed).toEqual(expect.arrayContaining([
+      'document_skill_execute',
+      'read',
+      'web_search',
+      'web_fetch',
+      'knowledge_search',
+      'knowledge_legal_external_sources',
+      'mcp_search',
+      'mcp_call'
+    ]))
+  })
+
+  it('recognizes retrieval-unavailable failures without hiding unrelated errors', () => {
+    expect(isRetrievalToolUnavailableMessage(
+      'This current-information request requires web_search, but the tool is unavailable.'
+    )).toBe(true)
+    expect(isRetrievalToolUnavailableMessage('检索工具暂不可用，无法调用网页检索')).toBe(true)
+    expect(isRetrievalToolUnavailableMessage('model request was rate limited')).toBe(false)
   })
 
   it('inherits the previous substantive Skill context for terse follow-ups', () => {
@@ -542,6 +572,46 @@ describe('AgentLoop', () => {
       event.code === 'http_400'
     )).toBe(true)
     expect(events.some((event) => event.kind === 'turn_failed')).toBe(true)
+  })
+
+  it('silently retries a retrieval-unavailable model response without retrieval tools', async () => {
+    const requests: ModelRequest[] = []
+    const webSearch = LocalToolHost.defineTool({
+      name: 'web_search',
+      description: 'search',
+      inputSchema: { type: 'object', properties: { query: { type: 'string' } } },
+      policy: 'auto',
+      execute: async () => ({ output: { results: [] } })
+    })
+    const h = makeHarness({
+      provider: 'retrieval-fallback',
+      model: 'retrieval-fallback',
+      async *stream(request): AsyncIterable<ModelStreamChunk> {
+        requests.push(request)
+        if (requests.length === 1) {
+          yield {
+            kind: 'error',
+            message: 'This current-information request requires web_search, but the tool is unavailable.',
+            code: 'capability_unavailable'
+          }
+          return
+        }
+        yield { kind: 'assistant_text_delta', text: '已基于现有材料完成修订。' }
+        yield { kind: 'completed', stopReason: 'stop' }
+      }
+    }, { tools: [webSearch] })
+    await bootstrapThread(h)
+
+    expect(await h.loop.runTurn(h.threadId, h.turnId)).toBe('completed')
+    const events = await h.sessionStore.loadEventsSince(h.threadId, 0)
+    const items = await h.sessionStore.loadItems(h.threadId)
+
+    expect(requests).toHaveLength(2)
+    expect(requests[0]?.tools.some((tool) => tool.name === 'web_search')).toBe(true)
+    expect(requests[1]?.tools.some((tool) => tool.name === 'web_search')).toBe(false)
+    expect(requests[1]?.contextInstructions?.join('\n')).toContain('不要输出或重复任何“工具不可用”')
+    expect(events.some((event) => event.kind === 'error')).toBe(false)
+    expect(items.some((item) => item.kind === 'assistant_text' && item.text === '已基于现有材料完成修订。')).toBe(true)
   })
 
   it('preserves partial model text when the stream ends with an error chunk', async () => {

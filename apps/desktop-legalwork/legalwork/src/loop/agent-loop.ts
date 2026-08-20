@@ -429,6 +429,10 @@ function extractToolError(output: unknown): string {
  * - 仅进程启动失败、超时等带 error 字段的真异常才上报。
  */
 function shouldReportToolError(toolName: string, output: unknown): boolean {
+  if (
+    READ_ONLY_RETRIEVAL_TOOL_NAMES.has(toolName) &&
+    isRetrievalToolUnavailableMessage(extractToolError(output))
+  ) return false
   if (toolName !== 'bash') return true
   if (!output || typeof output !== 'object') return true
   const record = output as Record<string, unknown>
@@ -1421,7 +1425,18 @@ function documentArtifactProgressInstruction(input: {
   ].join('\n')
 }
 
-function allowedToolNamesWithGuiStateTools(
+const READ_ONLY_RETRIEVAL_TOOL_NAMES = new Set([
+  'web_search',
+  'web_fetch',
+  'knowledge_auto_retrieve',
+  'knowledge_search',
+  'knowledge_read_file',
+  'knowledge_legal_external_sources',
+  'mcp_search',
+  'mcp_call'
+])
+
+export function allowedToolNamesWithGuiStateTools(
   allowedToolNames: readonly string[] | undefined,
   activeGoal: boolean,
   prompt = '',
@@ -1441,6 +1456,12 @@ function allowedToolNamesWithGuiStateTools(
   // catalog — otherwise the model sees the instruction but not the tool and
   // skips both template resolution and legal research.
   next.add('resolve_legal_document_template')
+  // A Skill allowlist may narrow mutating tools, but it must not make the
+  // assistant blind. Legal-document Skills in particular need to verify the
+  // current statute or locate a legal-database tool before drafting. Keeping
+  // these read-only retrieval/discovery tools available also avoids telling a
+  // model to research while simultaneously hiding every research tool.
+  for (const toolName of READ_ONLY_RETRIEVAL_TOOL_NAMES) next.add(toolName)
   if (requestsLocalKnowledgeRetrieval(prompt)) {
     next.add('knowledge_auto_retrieve')
     next.add('knowledge_search')
@@ -1476,6 +1497,14 @@ function allowedToolNamesWithGuiStateTools(
     next.add('bash')
   }
   return [...next]
+}
+
+export function isRetrievalToolUnavailableMessage(message: string): boolean {
+  const value = message.trim()
+  if (!value || value.length > 1_000) return false
+  const mentionsRetrieval = /(?:web[_ -]?search|web[_ -]?fetch|retrieval|search tool|brows(?:e|ing)|检索工具|搜索工具|联网工具|网页检索)/i.test(value)
+  const saysUnavailable = /(?:unavailable|not available|disabled|cannot (?:call|access|use)|can't (?:call|access|use)|requires? .{0,40}(?:tool|web[_ -]?search)|不可用|无法(?:调用|访问|使用)|未(?:启用|提供)|需要.{0,20}(?:工具|检索))/i.test(value)
+  return mentionsRetrieval && saysUnavailable
 }
 
 export type AgentLoopOptions = {
@@ -1582,6 +1611,8 @@ export class AgentLoop {
   private readonly reasoningOnlyContinuations = new Map<string, number>()
   /** One focused retry when the model announces work without performing it. */
   private readonly pendingWorkContinuations = new Map<string, number>()
+  /** Bounded silent retries when a provider/model claims retrieval is unavailable. */
+  private readonly retrievalUnavailableRecoveries = new Map<string, number>()
   /** Extract uploaded documents once; reuse the canonical text on every model step. */
   private readonly attachmentDocumentTextCache = new Map<string, AttachmentDocumentText>()
   /** One transparent compact-and-retry pass when a provider still reports an oversized context. */
@@ -1639,6 +1670,7 @@ export class AgentLoop {
       }
       this.reasoningOnlyContinuations.delete(turnId)
       this.pendingWorkContinuations.delete(turnId)
+      this.retrievalUnavailableRecoveries.delete(turnId)
       this.contextOverflowRecoveries.delete(turnId)
       this.legalResearchContinuations.delete(turnId)
     }
@@ -2830,7 +2862,7 @@ export class AgentLoop {
     // the final report. Stripping the catalog here made DeepSeek-compatible
     // models answer "继续补充获取民法典条文" and stop, leaving the turn with a
     // stage broadcast and no report.
-    const requestToolSpecs = requiredToolName
+    const unfilteredRequestToolSpecs = requiredToolName
       ? visibleScopedToolSpecs.filter(
           (tool) => tool.name === requiredToolName || BASE_WORK_TOOL_NAMES.has(tool.name)
         )
@@ -2839,6 +2871,10 @@ export class AgentLoop {
         : bareResearchTopic || documentMutationSatisfied || deliveryAttemptsExhausted
           ? []
           : visibleScopedToolSpecs
+    const retrievalFallbackActive = (this.retrievalUnavailableRecoveries.get(turnId) ?? 0) > 0
+    const requestToolSpecs = retrievalFallbackActive
+      ? unfilteredRequestToolSpecs.filter((tool) => !READ_ONLY_RETRIEVAL_TOOL_NAMES.has(tool.name))
+      : unfilteredRequestToolSpecs
     const officeWorkflowInstruction = specializedPresentationPending
       ? undefined
       : officeDocumentWorkflowInstruction({
@@ -2883,6 +2919,9 @@ export class AgentLoop {
       : undefined
     const pendingWorkRecoveryInstruction = (this.pendingWorkContinuations.get(turnId) ?? 0) > 0
       ? '上一次回复只说明了准备做什么。现在不要再预告步骤或新增检索，直接输出已经能够完成的最终正文或结果。'
+      : undefined
+    const retrievalFallbackInstruction = retrievalFallbackActive
+      ? '当前模型或服务无法使用检索工具。不要输出或重复任何“工具不可用”、“web_search unavailable”等内部错误；直接基于已有对话、附件和已取得的资料继续完成用户任务。只有在会影响结论可靠性时，才在结果中简短标注待核实之处。'
       : undefined
     const deliveryFailureInstruction = deliveryAttemptsExhausted
       ? '文件生成工具已达到有界重试次数。立即停止重试，输出可用正文或大纲，并简洁说明未能生成请求的文件。'
@@ -2932,6 +2971,7 @@ export class AgentLoop {
       ...(researchStageInstruction ? [researchStageInstruction] : []),
       ...(reasoningOnlyRecoveryInstruction ? [reasoningOnlyRecoveryInstruction] : []),
       ...(pendingWorkRecoveryInstruction ? [pendingWorkRecoveryInstruction] : []),
+      ...(retrievalFallbackInstruction ? [retrievalFallbackInstruction] : []),
       ...(deliveryFailureInstruction ? [deliveryFailureInstruction] : []),
       ...(requestToolSpecs.some((tool) => tool.name === 'bash') ? [shellRuntimeInstruction()] : []),
       ...(toolCatalogDriftMessage ? [toolCatalogDriftMessage] : []),
@@ -3215,13 +3255,19 @@ export class AgentLoop {
             stopReason = 'error'
             break
           }
-          await this.opts.events.record({
-            kind: 'error',
-            threadId,
-            turnId,
-            message: chunk.message,
-            code: chunk.code
-          })
+          // Retrieval availability is a capability mismatch, not a useful
+          // user-facing failure. Retry once without retrieval tools and with a
+          // best-effort answer instruction instead of rendering a red error
+          // card. This applies to every provider/model, not only DeepSeek.
+          if (!isRetrievalToolUnavailableMessage(chunk.message)) {
+            await this.opts.events.record({
+              kind: 'error',
+              threadId,
+              turnId,
+              message: chunk.message,
+              code: chunk.code
+            })
+          }
           streamErrorMessage = chunk.message
           stopReason = 'error'
           break
@@ -3317,6 +3363,17 @@ export class AgentLoop {
     if (looksLikeDsmlToolCalls(textAccumulator.value)) {
       textAccumulator.value = stripDsmlToolCalls(textAccumulator.value)
     }
+    if (
+      completedToolCalls.length === 0 &&
+      isRetrievalToolUnavailableMessage(textAccumulator.value)
+    ) {
+      const recoveryCount = this.retrievalUnavailableRecoveries.get(turnId) ?? 0
+      textAccumulator.value = ''
+      if (recoveryCount < 2) {
+        this.retrievalUnavailableRecoveries.set(turnId, recoveryCount + 1)
+        return 'continue'
+      }
+    }
     if (reasoningAccumulator.value) {
       const itemId = reasoningItemId || this.opts.ids.next('item_reasoning')
       await this.opts.turns.applyItem(
@@ -3346,6 +3403,20 @@ export class AgentLoop {
     if (stopReason === 'error' && completedToolCalls.length === 0) {
       const partial = textAccumulator.value.trim() || reasoningAccumulator.value.trim()
       const overflowRecoveries = this.contextOverflowRecoveries.get(turnId) ?? 0
+      if (!partial && isRetrievalToolUnavailableMessage(streamErrorMessage)) {
+        const recoveryCount = this.retrievalUnavailableRecoveries.get(turnId) ?? 0
+        if (recoveryCount < 2) {
+          this.retrievalUnavailableRecoveries.set(turnId, recoveryCount + 1)
+          await this.recordPipelineStage(threadId, turnId, 'response_received', {
+            label: 'Retrieval unavailable; continuing without retrieval tools'
+          })
+          return 'continue'
+        }
+        await this.recordPipelineStage(threadId, turnId, 'response_received', {
+          label: 'Retrieval fallback exhausted'
+        })
+        return 'stop'
+      }
       if (
         !partial &&
         isContextWindowExceededError(streamErrorMessage) &&
@@ -3962,26 +4033,42 @@ export class AgentLoop {
     call: ToolCallLike,
     result: ToolHostResult
   ): Promise<void> {
+    const silentRetrievalFailure =
+      result.item.kind === 'tool_result' &&
+      result.item.isError === true &&
+      READ_ONLY_RETRIEVAL_TOOL_NAMES.has(call.toolName) &&
+      isRetrievalToolUnavailableMessage(extractToolError(result.item.output))
+    let persistedResult: ToolHostResult = result
+    if (silentRetrievalFailure && result.item.kind === 'tool_result') {
+      persistedResult = {
+        ...result,
+        item: {
+          ...result.item,
+          isError: false,
+          status: 'completed'
+        }
+      }
+    }
     // 工具调用返回错误 → 通过 onToolError 回调上报（仅工具名+错误摘要，
     // 不含工具参数/对话内容，避免敏感信息外传）。
-    if (result.item.kind === 'tool_result' && result.item.isError === true && shouldReportToolError(call.toolName, result.item.output)) {
+    if (persistedResult.item.kind === 'tool_result' && persistedResult.item.isError === true && shouldReportToolError(call.toolName, persistedResult.item.output)) {
       try {
         this.opts.onToolError?.({
           threadId,
           turnId,
           toolName: call.toolName,
-          error: extractToolError(result.item.output)
+          error: extractToolError(persistedResult.item.output)
         })
       } catch {
         // 上报失败绝不影响 agent 主流程
       }
     }
     await this.opts.turns.updateItem(threadId, `item_tool_${turnId}_${call.callId}`, {
-      status: result.item.kind === 'tool_result' && result.item.isError ? 'failed' : 'completed',
+      status: persistedResult.item.kind === 'tool_result' && persistedResult.item.isError ? 'failed' : 'completed',
       finishedAt: this.opts.nowIso()
     } as Partial<TurnItem>)
-    await this.opts.turns.applyItem(threadId, result.item)
-    await this.afterToolResultPersisted(threadId, turnId, call, result)
+    await this.opts.turns.applyItem(threadId, persistedResult.item)
+    await this.afterToolResultPersisted(threadId, turnId, call, persistedResult)
   }
 
   private async afterToolResultPersisted(
